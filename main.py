@@ -1,4 +1,3 @@
-import asyncio
 import html
 import logging
 import os
@@ -11,14 +10,17 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from telegram import Chat, Update
+from telegram import BotCommand, Chat, Update
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 
@@ -47,7 +49,7 @@ ROLES = [
     Role("Шпион", "узнать у кого-то странную бытовую деталь, например что он ел сегодня", 1),
     Role("Тихий режиссер", "незаметно поменять тему разговора два раза", 1),
     Role("Миротворец", "погасить конфликт или спор до того, как он разрастется", 1),
-    Role("Архивариус", "вспомнить старый мем/историю чата так, чтобы ее подхватили", 2),
+    Role("Архивариус", "вспомнить старый мем или историю чата так, чтобы ее подхватили", 2),
     Role("Инфлюенсер", "заставить двоих людей повторить твою фразу или идею", 2),
     Role("Серый кардинал", "подтолкнуть другого игрока к выполнению его миссии", 3),
     Role("Хамелеон", "сыграть так, чтобы на тебя подозревали две разные роли", 4),
@@ -57,7 +59,7 @@ EVENTS = [
     "10 минут все говорят максимально серьезно. Кто сорвался первым, тот подозрителен.",
     "Следующие 10 минут можно подозревать только тех, кто уже писал сегодня.",
     "Все игроки получают право один раз блефануть о своей роли.",
-    "В ближайшие 10 минут любое слово 'кстати' считается уликой.",
+    "В ближайшие 10 минут любое слово «кстати» считается уликой.",
     "До конца раунда за правильный /sus дают +1 бонусное очко.",
 ]
 
@@ -66,6 +68,19 @@ ACHIEVEMENTS = {
     "sherlock": "Шерлок",
     "first_win": "Первая легенда",
 }
+
+BOT_COMMANDS = [
+    BotCommand("join", "войти в лобби"),
+    BotCommand("startgame", "начать раунд"),
+    BotCommand("sus", "подозревать игрока"),
+    BotCommand("me", "моя тайная роль"),
+    BotCommand("complete", "отметить миссию"),
+    BotCommand("event", "случайное событие"),
+    BotCommand("endgame", "завершить раунд"),
+    BotCommand("score", "мой профиль"),
+    BotCommand("leaderboard", "рейтинг"),
+    BotCommand("head", "справка по игре"),
+]
 
 
 def now_iso() -> str:
@@ -139,13 +154,78 @@ def init_db() -> None:
         conn.commit()
 
 
+def esc(value: object) -> str:
+    return html.escape(str(value))
+
+
 def mention(user_id: int, name: str) -> str:
-    safe_name = html.escape(name or "игрок")
+    safe_name = esc(name or "игрок")
     return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
 
 def player_name(row: sqlite3.Row) -> str:
     return row["username"] and f'@{row["username"]}' or row["first_name"] or str(row["user_id"])
+
+
+def card(title: str, *sections: str) -> str:
+    clean_sections = [section for section in sections if section]
+    body = "\n\n".join(clean_sections)
+    return f"╔ <b>{esc(title)}</b>\n{body}\n╚ <i>Двойная жизнь</i>"
+
+
+def command_line(command: str, text: str) -> str:
+    return f"• <code>{esc(command)}</code> - {esc(text)}"
+
+
+async def reply_html(update: Update, text: str) -> None:
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def send_html(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+def rules_text(short: bool = False) -> str:
+    intro = (
+        "Это чатовая социальная игра: все продолжают общаться как обычно, "
+        "но у каждого есть тайная роль и скрытая миссия."
+    )
+    flow = "\n".join(
+        [
+            "1. Игроки пишут <code>/join</code>.",
+            "2. Ведущий запускает <code>/startgame</code>.",
+            "3. Я отправляю роли каждому в личку.",
+            "4. Все выполняют миссии незаметно.",
+            "5. Подозрения кидаются через <code>/sus @username роль</code>.",
+            "6. В конце <code>/endgame</code> раскрывает роли и начисляет очки.",
+        ]
+    )
+    commands = "\n".join(
+        [
+            command_line("/join", "войти в лобби"),
+            command_line("/startgame", "раздать роли"),
+            command_line("/me", "посмотреть свою роль"),
+            command_line("/sus @user роль", "проверить подозрение"),
+            command_line("/complete", "отметить миссию выполненной"),
+            command_line("/event", "случайное событие"),
+            command_line("/score", "очки, уровень и звание"),
+            command_line("/leaderboard", "таблица лидеров"),
+            command_line("/endgame", "финал раунда"),
+            command_line("/head", "эта справка"),
+        ]
+    )
+    if short:
+        return card("Как играть", intro, flow)
+    return card("Как играть", intro, f"<b>Ход игры</b>\n{flow}", f"<b>Команды</b>\n{commands}")
 
 
 def level_for(points: int) -> int:
@@ -215,21 +295,48 @@ def choose_role(used: set[str], player_points: int) -> Role:
     return random.choice(available)
 
 
+async def welcome_when_added(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    member_update = update.my_chat_member
+    if not member_update:
+        return
+
+    old_status = member_update.old_chat_member.status
+    new_status = member_update.new_chat_member.status
+    was_out = old_status in {"left", "kicked"}
+    is_in = new_status in {"member", "administrator"}
+    if not was_out or not is_in:
+        return
+
+    chat = member_update.chat
+    remember_chat(chat)
+    text = card(
+        "Я в чате. Начинаем двойную жизнь?",
+        (
+            "Привет всем. Я превращаю обычный чат в социальную игру с тайными ролями, "
+            "миссиями, подозрениями, очками, уровнями и финальным раскрытием."
+        ),
+        (
+            "<b>Быстрый старт</b>\n"
+            f"{command_line('/join', 'каждый игрок входит в лобби')}\n"
+            f"{command_line('/startgame', 'я раздаю роли в личку')}\n"
+            f"{command_line('/sus @user роль', 'проверить подозрение')}\n"
+            f"{command_line('/endgame', 'раскрыть роли и начислить очки')}"
+        ),
+        "Важно: перед игрой каждому нужно открыть личку со мной и нажать <code>/start</code>, иначе я не смогу отправить секретную роль.",
+    )
+    await send_html(context, chat.id, text)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     upsert_player(update)
-    text = (
-        "Ты в игре 'Двойная жизнь'.\n\n"
-        "Добавь меня в групповой чат и используй:\n"
-        "/join - войти в раунд\n"
-        "/startgame - раздать тайные роли\n"
-        "/sus @user роль - подозрение\n"
-        "/me - моя роль\n"
-        "/endgame - раскрыть роли и начислить очки\n"
-    )
-    await update.effective_message.reply_text(text)
+    await reply_html(update, rules_text())
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await start(update, context)
+
+
+async def head(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start(update, context)
 
 
@@ -240,14 +347,14 @@ async def join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not chat or not user:
         return
     if chat.type == Chat.PRIVATE:
-        await update.effective_message.reply_text("Вступать надо в групповом чате. В личке я храню твои роли.")
+        await reply_html(update, card("Лобби только в группе", "В личке я храню секретные роли. Для входа в раунд напиши <code>/join</code> в общем чате."))
         return
 
     remember_chat(chat)
     with closing(db()) as conn:
         game = active_game(conn, chat.id)
         if game:
-            await update.effective_message.reply_text("Раунд уже идет. Дождись следующего, чтобы не ломать интригу.")
+            await reply_html(update, card("Раунд уже идет", "Дождись следующего запуска, чтобы не ломать интригу текущей партии."))
             return
 
         pending = conn.execute(
@@ -277,8 +384,13 @@ async def join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             (pending_id,),
         ).fetchone()[0]
 
-    await update.effective_message.reply_html(
-        f"{mention(user.id, user.first_name)} в игре. Игроков в лобби: {count}."
+    await reply_html(
+        update,
+        card(
+            "Игрок в лобби",
+            f"{mention(user.id, user.first_name)} присоединился к раунду.",
+            f"<b>Игроков в лобби:</b> {count}\nКогда все готовы: <code>/startgame</code>",
+        ),
     )
 
 
@@ -286,13 +398,13 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     upsert_player(update)
     chat = update.effective_chat
     if not chat or chat.type == Chat.PRIVATE:
-        await update.effective_message.reply_text("Запускать раунд нужно в группе.")
+        await reply_html(update, card("Запуск только в группе", "Раунд нужно запускать там, где будет происходить игра."))
         return
 
     remember_chat(chat)
     with closing(db()) as conn:
         if active_game(conn, chat.id):
-            await update.effective_message.reply_text("Раунд уже активен.")
+            await reply_html(update, card("Раунд уже активен", "Сначала завершите текущую игру командой <code>/endgame</code>."))
             return
 
         game = conn.execute(
@@ -300,7 +412,7 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             (chat.id,),
         ).fetchone()
         if not game:
-            await update.effective_message.reply_text("Пока нет игроков. Сначала напишите /join.")
+            await reply_html(update, card("Лобби пустое", "Сначала игроки должны написать <code>/join</code>."))
             return
 
         participants = conn.execute(
@@ -313,7 +425,7 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             (game["id"],),
         ).fetchall()
         if len(participants) < 2:
-            await update.effective_message.reply_text("Нужно минимум 2 игрока. Один человек может жить двойной жизнью, но это уже грустновато.")
+            await reply_html(update, card("Нужно больше игроков", "Минимум для раунда - 2 человека."))
             return
 
         used_roles: set[str] = set()
@@ -346,23 +458,33 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     failed = []
     for participant, role in assignments:
-        text = (
-            f"Твоя тайная роль: {role.name}\n"
-            f"Миссия: {role.mission}\n\n"
-            "Играй незаметно. В конце раунда группа попробует понять, кто ты."
+        text = card(
+            "Твоя тайная роль",
+            f"<b>{esc(role.name)}</b>",
+            f"<b>Миссия:</b>\n{esc(role.mission)}",
+            "Играй незаметно. В конце раунда чат попробует понять, кем ты был.",
         )
         try:
-            await context.bot.send_message(participant["user_id"], text)
+            await send_html(context, participant["user_id"], text)
         except Forbidden:
             failed.append(player_name(participant))
         except TelegramError as exc:
             logger.warning("Failed to DM user %s: %s", participant["user_id"], exc)
             failed.append(player_name(participant))
 
-    message = f"Раунд начался. Роли ушли в личку {len(assignments)} игрокам."
+    message = card(
+        "Раунд начался",
+        f"Роли ушли в личку <b>{len(assignments)}</b> игрокам.",
+        "Теперь общайтесь как обычно, но присматривайтесь к каждому странному повороту разговора.",
+        f"<b>Подозрение:</b> <code>/sus @username роль</code>\n<b>Финал:</b> <code>/endgame</code>",
+    )
     if failed:
-        message += "\nНе смог написать: " + ", ".join(failed) + ". Им нужно открыть личку с ботом и нажать /start."
-    await update.effective_message.reply_text(message)
+        message += "\n\n" + card(
+            "Не смог отправить роль",
+            ", ".join(esc(name) for name in failed),
+            "Этим игрокам нужно открыть личку со мной и нажать <code>/start</code>.",
+        )
+    await reply_html(update, message)
 
 
 async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -382,9 +504,9 @@ async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             (user.id,),
         ).fetchone()
     if not row:
-        await update.effective_message.reply_text("У тебя сейчас нет активной роли.")
+        await reply_html(update, card("Роли пока нет", "Ты сейчас не участвуешь в активном раунде."))
         return
-    await update.effective_message.reply_text(f"Твоя роль: {row['role_name']}\nМиссия: {row['mission']}")
+    await reply_html(update, card("Твоя роль", f"<b>{esc(row['role_name'])}</b>", f"<b>Миссия:</b>\n{esc(row['mission'])}"))
 
 
 async def suspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -392,11 +514,11 @@ async def suspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     suspect_user = update.effective_user
     if not chat or not suspect_user or chat.type == Chat.PRIVATE:
-        await update.effective_message.reply_text("Подозревать надо в группе: /sus @username роль")
+        await reply_html(update, card("Подозрение только в группе", "Формат: <code>/sus @username роль</code>"))
         return
 
     if not context.args or len(context.args) < 2:
-        await update.effective_message.reply_text("Формат: /sus @username роль")
+        await reply_html(update, card("Нужен формат", "Напиши так: <code>/sus @username роль</code>"))
         return
 
     target_token = context.args[0].lstrip("@").lower()
@@ -405,7 +527,7 @@ async def suspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with closing(db()) as conn:
         game = active_game(conn, chat.id)
         if not game:
-            await update.effective_message.reply_text("Сейчас нет активного раунда.")
+            await reply_html(update, card("Нет активного раунда", "Сначала запустите игру через <code>/startgame</code>."))
             return
 
         target = conn.execute(
@@ -419,10 +541,10 @@ async def suspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             (game["id"], target_token, target_token),
         ).fetchone()
         if not target:
-            await update.effective_message.reply_text("Не нашел такого игрока в этом раунде. Лучше используй username.")
+            await reply_html(update, card("Игрок не найден", "Не вижу такого участника в текущем раунде. Надежнее всего использовать username."))
             return
         if target["user_id"] == suspect_user.id:
-            await update.effective_message.reply_text("Самоподозрение звучит глубоко, но очков за него нет.")
+            await reply_html(update, card("Красиво, но нет", "Самоподозрение звучит драматично, но очков за него не будет."))
             return
 
         already = conn.execute(
@@ -433,7 +555,7 @@ async def suspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             (game["id"], suspect_user.id, target["user_id"]),
         ).fetchone()
         if already:
-            await update.effective_message.reply_text("Ты уже подозревал этого игрока в текущем раунде.")
+            await reply_html(update, card("Подозрение уже есть", "На одного игрока можно сделать одно подозрение за раунд."))
             return
 
         correct = int(guessed_role == target["role_name"].lower())
@@ -452,11 +574,16 @@ async def suspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         conn.commit()
 
     if correct:
-        await update.effective_message.reply_html(
-            f"Попадание. {mention(target['user_id'], player_name(target))} раскрыт: {html.escape(target['role_name'])}."
+        await reply_html(
+            update,
+            card(
+                "Попадание",
+                f"{mention(target['user_id'], player_name(target))} раскрыт.",
+                f"<b>Роль:</b> {esc(target['role_name'])}",
+            ),
         )
     else:
-        await update.effective_message.reply_text("Подозрение записано. Узнаем правду в конце раунда.")
+        await reply_html(update, card("Подозрение записано", "Пока не раскрываю правду. Финал все расставит по местам."))
 
 
 async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -464,12 +591,12 @@ async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     user = update.effective_user
     if not chat or not user or chat.type == Chat.PRIVATE:
-        await update.effective_message.reply_text("Отмечать миссию нужно в группе.")
+        await reply_html(update, card("Отметка только в группе", "Миссию нужно отмечать в чате текущего раунда."))
         return
     with closing(db()) as conn:
         game = active_game(conn, chat.id)
         if not game:
-            await update.effective_message.reply_text("Сейчас нет активного раунда.")
+            await reply_html(update, card("Нет активного раунда", "Сначала запустите игру через <code>/startgame</code>."))
             return
         updated = conn.execute(
             "UPDATE participants SET completed = 1 WHERE game_id = ? AND user_id = ?",
@@ -477,9 +604,9 @@ async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ).rowcount
         conn.commit()
     if updated:
-        await update.effective_message.reply_text("Миссия отмечена как выполненная. На финале начислю очки.")
+        await reply_html(update, card("Миссия отмечена", "На финале я начислю очки за выполнение."))
     else:
-        await update.effective_message.reply_text("Ты не участвуешь в этом раунде.")
+        await reply_html(update, card("Ты не в раунде", "Напиши <code>/join</code> перед следующей партией."))
 
 
 async def event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -488,9 +615,9 @@ async def event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     with closing(db()) as conn:
         if not active_game(conn, chat.id):
-            await update.effective_message.reply_text("События включаются только во время активного раунда.")
+            await reply_html(update, card("Событие пока нельзя", "Случайные события включаются только во время активного раунда."))
             return
-    await update.effective_message.reply_text("Случайное событие: " + random.choice(EVENTS))
+    await reply_html(update, card("Случайное событие", esc(random.choice(EVENTS))))
 
 
 def grant_achievement(conn: sqlite3.Connection, user_id: int, code: str) -> None:
@@ -504,13 +631,13 @@ async def end_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     upsert_player(update)
     chat = update.effective_chat
     if not chat or chat.type == Chat.PRIVATE:
-        await update.effective_message.reply_text("Завершать раунд нужно в группе.")
+        await reply_html(update, card("Финал только в группе", "Завершать раунд нужно там, где он проходил."))
         return
 
     with closing(db()) as conn:
         game = active_game(conn, chat.id)
         if not game:
-            await update.effective_message.reply_text("Активного раунда нет.")
+            await reply_html(update, card("Раунда нет", "Активного раунда сейчас нет."))
             return
 
         participants = conn.execute(
@@ -568,27 +695,34 @@ async def end_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         conn.execute("UPDATE chats SET active_game_id = NULL WHERE chat_id = ?", (chat.id,))
         conn.commit()
 
-    lines = ["Финал раунда. Роли раскрыты:"]
+    reveal_lines = []
     for participant in participants:
         name = mention(participant["user_id"], player_name(participant))
-        status = "выполнил" if participant["completed"] else "не отметил миссию"
-        exposed = "раскрыт" if participant["exposed"] else "не раскрыт"
-        lines.append(
-            f"{name} - <b>{html.escape(participant['role_name'])}</b>: "
-            f"{html.escape(participant['mission'])} ({status}, {exposed}, +{scores[participant['user_id']]})"
+        status = "миссия выполнена" if participant["completed"] else "миссия не отмечена"
+        exposed = "раскрыт" if participant["exposed"] else "сохранил маску"
+        reveal_lines.append(
+            f"• {name}\n"
+            f"  <b>{esc(participant['role_name'])}</b> - {esc(participant['mission'])}\n"
+            f"  {esc(status)}, {esc(exposed)}, <b>+{scores[participant['user_id']]}</b>"
         )
 
-    if suspicions:
-        lines.append("\nПодозрения:")
-        for suspicion in suspicions:
-            mark = "верно" if suspicion["correct"] else "мимо"
-            lines.append(
-                f"{html.escape(suspicion['suspect_name'] or 'Игрок')} -> "
-                f"{html.escape(suspicion['target_name'] or 'игрок')}: "
-                f"{html.escape(suspicion['guessed_role'])} ({mark})"
-            )
+    suspicion_lines = []
+    for suspicion in suspicions:
+        mark = "верно" if suspicion["correct"] else "мимо"
+        suspicion_lines.append(
+            f"• {esc(suspicion['suspect_name'] or 'Игрок')} -> "
+            f"{esc(suspicion['target_name'] or 'игрок')}: "
+            f"{esc(suspicion['guessed_role'])} ({esc(mark)})"
+        )
 
-    await update.effective_message.reply_html("\n".join(lines), disable_web_page_preview=True)
+    await reply_html(
+        update,
+        card(
+            "Финал раунда",
+            "<b>Роли раскрыты</b>\n" + "\n".join(reveal_lines),
+            suspicion_lines and "<b>Подозрения</b>\n" + "\n".join(suspicion_lines),
+        ),
+    )
 
 
 async def score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -602,8 +736,13 @@ async def score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     points = row["points"] if row else 0
     lvl = level_for(points)
     unlocked = ", ".join(ACHIEVEMENTS[a["code"]] for a in achievements if a["code"] in ACHIEVEMENTS) or "пока нет"
-    await update.effective_message.reply_text(
-        f"Очки: {points}\nУровень: {lvl}\nЗвание: {title_for(lvl)}\nДостижения: {unlocked}"
+    await reply_html(
+        update,
+        card(
+            "Профиль игрока",
+            f"<b>Очки:</b> {points}\n<b>Уровень:</b> {lvl}\n<b>Звание:</b> {esc(title_for(lvl))}",
+            f"<b>Достижения:</b> {esc(unlocked)}",
+        ),
     )
 
 
@@ -613,13 +752,13 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "SELECT * FROM players ORDER BY points DESC, correct_sus DESC LIMIT 10"
         ).fetchall()
     if not rows:
-        await update.effective_message.reply_text("Рейтинг пока пуст.")
+        await reply_html(update, card("Рейтинг пуст", "Сыграйте первый раунд, и здесь появятся легенды чата."))
         return
-    lines = ["Топ игроков:"]
+    lines = []
     for index, row in enumerate(rows, start=1):
         lvl = level_for(row["points"])
-        lines.append(f"{index}. {player_name(row)} - {row['points']} очков, ур. {lvl}")
-    await update.effective_message.reply_text("\n".join(lines))
+        lines.append(f"{index}. <b>{esc(player_name(row))}</b> - {row['points']} очков, ур. {lvl}")
+    await reply_html(update, card("Топ игроков", "\n".join(lines)))
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -646,6 +785,7 @@ def run_health_server() -> None:
 
 
 async def post_init(application: Application) -> None:
+    await application.bot.set_my_commands(BOT_COMMANDS)
     thread = threading.Thread(target=run_health_server, daemon=True)
     thread.start()
 
@@ -655,8 +795,11 @@ def build_app() -> Application:
         raise RuntimeError("BOT_TOKEN environment variable is required")
 
     application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    application.add_handler(ChatMemberHandler(welcome_when_added, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("head", head))
+    application.add_handler(MessageHandler(filters.Regex(r"^/хед(@\w+)?$"), head))
     application.add_handler(CommandHandler("join", join))
     application.add_handler(CommandHandler("startgame", start_game))
     application.add_handler(CommandHandler("me", me))

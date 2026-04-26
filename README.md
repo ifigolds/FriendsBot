@@ -1,0 +1,52 @@
+# Double Life Telegram Bot
+
+Мини-игра для компании друзей: бот раздает тайные роли в личку, игроки выполняют миссии в обычном чате, подозревают друг друга и получают очки.
+
+## Команды
+
+- `/join` - войти в лобби раунда.
+- `/startgame` - начать раунд и раздать роли.
+- `/me` - посмотреть свою текущую роль в личке или группе.
+- `/sus @username роль` - подозревать игрока.
+- `/complete` - отметить свою миссию выполненной.
+- `/event` - включить случайное событие.
+- `/endgame` - раскрыть роли и начислить очки.
+- `/score` - очки, уровень, звание и достижения.
+- `/leaderboard` - топ игроков.
+
+## Локальный запуск
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+set BOT_TOKEN=your_botfather_token
+python main.py
+```
+
+В PowerShell:
+
+```powershell
+$env:BOT_TOKEN="your_botfather_token"
+python main.py
+```
+
+## Telegram setup
+
+1. Создай бота через BotFather и получи токен.
+2. Напиши боту `/start` в личку, иначе он не сможет присылать роли.
+3. Добавь бота в групповой чат.
+4. Если хочешь, чтобы бот видел обычные сообщения в будущем, отключи Privacy Mode у BotFather. Для текущих команд это не обязательно.
+
+## Deploy на Render
+
+Проект уже содержит `render.yaml`. Он настроен как paid web service с persistent disk, чтобы SQLite-база с очками не пропадала после рестартов.
+
+1. Создай GitHub/GitLab/Bitbucket репозиторий и запушь код.
+2. Открой Render Dashboard и создай Blueprint из репозитория.
+3. Заполни secret env var `BOT_TOKEN`.
+4. Нажми Apply.
+
+Health endpoint доступен на `/health`.
+
+Если нужен полностью бесплатный тест, можно убрать блок `disk` из `render.yaml` и поставить `plan: free`, но тогда очки и активные игры будут теряться при рестарте или засыпании сервиса.

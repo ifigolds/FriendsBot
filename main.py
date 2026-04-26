@@ -82,6 +82,15 @@ BOT_COMMANDS = [
     BotCommand("head", "справка по игре"),
 ]
 
+CARD_EMOJIS = ["🎭", "🕵️", "✨", "🧠", "🔥", "💅", "👀", "🎲", "🏆", "🤌"]
+FOOTER_LINES = [
+    "социальный эксперимент почти без последствий",
+    "театр одного чата, бюджет ноль, интрига бесценна",
+    "все совпадения подозрительны",
+    "если стало неловко, значит игра работает",
+    "делаем вид, что всё под контролем",
+]
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -170,11 +179,13 @@ def player_name(row: sqlite3.Row) -> str:
 def card(title: str, *sections: str) -> str:
     clean_sections = [section for section in sections if section]
     body = "\n\n".join(clean_sections)
-    return f"╔ <b>{esc(title)}</b>\n{body}\n╚ <i>Двойная жизнь</i>"
+    emoji = random.choice(CARD_EMOJIS)
+    footer = random.choice(FOOTER_LINES)
+    return f"{emoji} <b>{esc(title)}</b> {emoji}\n━━━━━━━━━━━━━━\n{body}\n\n🫡 <i>{esc(footer)}</i>"
 
 
 def command_line(command: str, text: str) -> str:
-    return f"• <code>{esc(command)}</code> - {esc(text)}"
+    return f"▫️ <code>{esc(command)}</code> — {esc(text)}"
 
 
 async def reply_html(update: Update, text: str) -> None:
@@ -197,7 +208,8 @@ async def send_html(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str)
 def rules_text(short: bool = False) -> str:
     intro = (
         "Это чатовая социальная игра: все продолжают общаться как обычно, "
-        "но у каждого есть тайная роль и скрытая миссия."
+        "но у каждого есть тайная роль и скрытая миссия. Официально это игра, "
+        "неофициально - маленький сериал с подозрительно знакомыми актерами 😌"
     )
     flow = "\n".join(
         [
@@ -313,7 +325,8 @@ async def welcome_when_added(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "Я в чате. Начинаем двойную жизнь?",
         (
             "Привет всем. Я превращаю обычный чат в социальную игру с тайными ролями, "
-            "миссиями, подозрениями, очками, уровнями и финальным раскрытием."
+            "миссиями, подозрениями, очками, уровнями и финальным раскрытием. "
+            "Ваш чат был нормальным. Был."
         ),
         (
             "<b>Быстрый старт</b>\n"
@@ -322,7 +335,7 @@ async def welcome_when_added(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"{command_line('/sus @user роль', 'проверить подозрение')}\n"
             f"{command_line('/endgame', 'раскрыть роли и начислить очки')}"
         ),
-        "Важно: перед игрой каждому нужно открыть личку со мной и нажать <code>/start</code>, иначе я не смогу отправить секретную роль.",
+        "Важно: перед игрой каждому нужно открыть личку со мной и нажать <code>/start</code>, иначе я не смогу отправить секретную роль. Да, бюрократия добралась даже до хаоса.",
     )
     await send_html(context, chat.id, text)
 
@@ -388,8 +401,8 @@ async def join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update,
         card(
             "Игрок в лобби",
-            f"{mention(user.id, user.first_name)} присоединился к раунду.",
-            f"<b>Игроков в лобби:</b> {count}\nКогда все готовы: <code>/startgame</code>",
+            f"{mention(user.id, user.first_name)} присоединился к раунду. Очень подозрительно, но пока законно 😎",
+            f"<b>Игроков в лобби:</b> {count}\nКогда все готовы: <code>/startgame</code>\nПахнет интригой и групповым чатом.",
         ),
     )
 
@@ -462,7 +475,7 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "Твоя тайная роль",
             f"<b>{esc(role.name)}</b>",
             f"<b>Миссия:</b>\n{esc(role.mission)}",
-            "Играй незаметно. В конце раунда чат попробует понять, кем ты был.",
+            "Играй незаметно. В конце раунда чат попробует понять, кем ты был. Держи лицо, даже если миссия кричит внутри.",
         )
         try:
             await send_html(context, participant["user_id"], text)
@@ -475,7 +488,7 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     message = card(
         "Раунд начался",
         f"Роли ушли в личку <b>{len(assignments)}</b> игрокам.",
-        "Теперь общайтесь как обычно, но присматривайтесь к каждому странному повороту разговора.",
+        "Теперь общайтесь как обычно, но присматривайтесь к каждому странному повороту разговора. Если кто-то внезапно стал философом - ну вы поняли 👀",
         f"<b>Подозрение:</b> <code>/sus @username роль</code>\n<b>Финал:</b> <code>/endgame</code>",
     )
     if failed:

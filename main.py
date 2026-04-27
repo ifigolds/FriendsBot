@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 import os
@@ -70,8 +71,10 @@ ACHIEVEMENTS = {
 }
 
 BOT_COMMANDS = [
+    BotCommand("play", "просто начать играть"),
     BotCommand("join", "войти в лобби"),
     BotCommand("startgame", "начать раунд"),
+    BotCommand("roles", "все роли в личку"),
     BotCommand("sus", "подозревать игрока"),
     BotCommand("me", "моя тайная роль"),
     BotCommand("complete", "отметить миссию"),
@@ -80,6 +83,7 @@ BOT_COMMANDS = [
     BotCommand("score", "мой профиль"),
     BotCommand("leaderboard", "рейтинг"),
     BotCommand("head", "справка по игре"),
+    BotCommand("clean", "убрать сообщения бота"),
 ]
 
 CARD_EMOJIS = ["🎭", "🕵️", "✨", "🧠", "🔥", "💅", "👀", "🎲", "🏆", "🤌"]
@@ -158,6 +162,13 @@ def init_db() -> None:
                 earned_at TEXT NOT NULL,
                 PRIMARY KEY (user_id, code)
             );
+
+            CREATE TABLE IF NOT EXISTS bot_messages (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            );
             """
         )
         conn.commit()
@@ -189,20 +200,33 @@ def command_line(command: str, text: str) -> str:
 
 
 async def reply_html(update: Update, text: str) -> None:
-    await update.effective_message.reply_text(
+    sent = await update.effective_message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+    remember_bot_message(sent.chat_id, sent.message_id)
 
 
 async def send_html(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
-    await context.bot.send_message(
+    sent = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+    remember_bot_message(sent.chat_id, sent.message_id)
+
+
+def remember_bot_message(chat_id: int, message_id: int) -> None:
+    if chat_id > 0:
+        return
+    with closing(db()) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO bot_messages (chat_id, message_id, created_at) VALUES (?, ?, ?)",
+            (chat_id, message_id, now_iso()),
+        )
+        conn.commit()
 
 
 def rules_text(short: bool = False) -> str:
@@ -224,7 +248,9 @@ def rules_text(short: bool = False) -> str:
     commands = "\n".join(
         [
             command_line("/join", "войти в лобби"),
+            command_line("/play", "самый простой вход в игру"),
             command_line("/startgame", "раздать роли"),
+            command_line("/roles", "получить весь список ролей в личку"),
             command_line("/me", "посмотреть свою роль"),
             command_line("/sus @user роль", "проверить подозрение"),
             command_line("/complete", "отметить миссию выполненной"),
@@ -232,12 +258,25 @@ def rules_text(short: bool = False) -> str:
             command_line("/score", "очки, уровень и звание"),
             command_line("/leaderboard", "таблица лидеров"),
             command_line("/endgame", "финал раунда"),
+            command_line("/clean", "убрать мои сообщения из группы"),
             command_line("/head", "эта справка"),
         ]
     )
     if short:
         return card("Как играть", intro, flow)
     return card("Как играть", intro, f"<b>Ход игры</b>\n{flow}", f"<b>Команды</b>\n{commands}")
+
+
+def roles_text() -> str:
+    lines = []
+    for role in ROLES:
+        locked = "" if role.level == 1 else f" · открывается с ур. {role.level}"
+        lines.append(f"▫️ <b>{esc(role.name)}</b>{esc(locked)}\n   {esc(role.mission)}")
+    return card(
+        "Каталог ролей",
+        "Вот все роли, чтобы понимать, кого подозревать. Пользоваться этим знанием можно мудро, а можно как обычно 😌",
+        "\n".join(lines),
+    )
 
 
 def level_for(points: int) -> int:
@@ -330,10 +369,12 @@ async def welcome_when_added(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ),
         (
             "<b>Быстрый старт</b>\n"
-            f"{command_line('/join', 'каждый игрок входит в лобби')}\n"
-            f"{command_line('/startgame', 'я раздаю роли в личку')}\n"
+            f"{command_line('/play', 'нажми, чтобы войти в игру без лишней философии')}\n"
+            f"{command_line('/startgame', 'когда все вошли, я раздаю роли в личку')}\n"
+            f"{command_line('/roles', 'полный список ролей прилетит в личку')}\n"
             f"{command_line('/sus @user роль', 'проверить подозрение')}\n"
-            f"{command_line('/endgame', 'раскрыть роли и начислить очки')}"
+            f"{command_line('/endgame', 'раскрыть роли и начислить очки')}\n"
+            f"{command_line('/clean', 'убрать мои сообщения из группы')}"
         ),
         "Важно: перед игрой каждому нужно открыть личку со мной и нажать <code>/start</code>, иначе я не смогу отправить секретную роль. Да, бюрократия добралась даже до хаоса.",
     )
@@ -343,6 +384,8 @@ async def welcome_when_added(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     upsert_player(update)
     await reply_html(update, rules_text())
+    if update.effective_chat and update.effective_chat.type == Chat.PRIVATE:
+        await reply_html(update, roles_text())
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -353,6 +396,77 @@ async def head(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start(update, context)
 
 
+async def roles(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    upsert_player(update)
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return
+    if chat.type == Chat.PRIVATE:
+        await reply_html(update, roles_text())
+        return
+    try:
+        await send_html(context, user.id, roles_text())
+        await reply_html(update, card("Роли улетели в личку", "Список ролей отправлен приватно. Делайте вид, что это было исследование, а не подготовка к психологической операции 🕵️"))
+    except Forbidden:
+        await reply_html(update, card("Личка закрыта", f"{mention(user.id, user.first_name)}, сначала открой личку со мной и нажми <code>/start</code>. Потом <code>/roles</code> сработает как надо."))
+
+
+async def play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat and chat.type == Chat.PRIVATE:
+        await start(update, context)
+        return
+    await join(update, context)
+
+
+async def clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat or chat.type == Chat.PRIVATE:
+        await reply_html(update, card("Чистка только в группе", "В личке я и так веду себя прилично. Почти."))
+        return
+
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT message_id FROM bot_messages WHERE chat_id = ? ORDER BY message_id DESC LIMIT 100",
+            (chat.id,),
+        ).fetchall()
+
+    deleted = 0
+    for row in rows:
+        try:
+            await context.bot.delete_message(chat_id=chat.id, message_id=row["message_id"])
+            deleted += 1
+        except TelegramError:
+            continue
+
+    with closing(db()) as conn:
+        conn.execute("DELETE FROM bot_messages WHERE chat_id = ?", (chat.id,))
+        conn.commit()
+
+    try:
+        await context.bot.delete_message(chat_id=chat.id, message_id=update.effective_message.message_id)
+    except TelegramError:
+        pass
+
+    notice = await context.bot.send_message(
+        chat_id=chat.id,
+        text=f"🧹 Убрал свои сообщения: {deleted}. Чат снова делает вид, что ничего не было.",
+    )
+    remember_bot_message(notice.chat_id, notice.message_id)
+    await asyncio.sleep(5)
+    try:
+        await context.bot.delete_message(chat_id=chat.id, message_id=notice.message_id)
+    except TelegramError:
+        return
+    with closing(db()) as conn:
+        conn.execute(
+            "DELETE FROM bot_messages WHERE chat_id = ? AND message_id = ?",
+            (chat.id, notice.message_id),
+        )
+        conn.commit()
+
+
 async def join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     upsert_player(update)
     chat = update.effective_chat
@@ -360,7 +474,7 @@ async def join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not chat or not user:
         return
     if chat.type == Chat.PRIVATE:
-        await reply_html(update, card("Лобби только в группе", "В личке я храню секретные роли. Для входа в раунд напиши <code>/join</code> в общем чате."))
+        await reply_html(update, card("Лобби только в группе", "В личке я храню секретные роли и список ролей. Для входа в раунд напиши <code>/play</code> в общем чате."))
         return
 
     remember_chat(chat)
@@ -405,6 +519,17 @@ async def join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"<b>Игроков в лобби:</b> {count}\nКогда все готовы: <code>/startgame</code>\nПахнет интригой и групповым чатом.",
         ),
     )
+    try:
+        await send_html(context, user.id, rules_text(short=True))
+        await send_html(context, user.id, roles_text())
+    except Forbidden:
+        await reply_html(
+            update,
+            card(
+                "Личка закрыта",
+                f"{mention(user.id, user.first_name)}, открой личку со мной и нажми <code>/start</code>, чтобы получить правила, все роли и свою секретную роль на старте.",
+            ),
+        )
 
 
 async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -425,7 +550,7 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             (chat.id,),
         ).fetchone()
         if not game:
-            await reply_html(update, card("Лобби пустое", "Сначала игроки должны написать <code>/join</code>."))
+            await reply_html(update, card("Лобби пустое", "Сначала игроки должны написать <code>/play</code>. Это теперь главная кнопка хаоса."))
             return
 
         participants = conn.execute(
@@ -813,6 +938,9 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("head", head))
     application.add_handler(MessageHandler(filters.Regex(r"^/хед(@\w+)?$"), head))
+    application.add_handler(CommandHandler("play", play))
+    application.add_handler(CommandHandler("roles", roles))
+    application.add_handler(CommandHandler("clean", clean))
     application.add_handler(CommandHandler("join", join))
     application.add_handler(CommandHandler("startgame", start_game))
     application.add_handler(CommandHandler("me", me))

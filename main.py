@@ -11,12 +11,13 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from telegram import BotCommand, Chat, Update
+from telegram import BotCommand, Chat, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
@@ -73,7 +74,9 @@ ACHIEVEMENTS = {
 BOT_COMMANDS = [
     BotCommand("play", "просто начать играть"),
     BotCommand("join", "войти в лобби"),
+    BotCommand("leave", "выйти из лобби"),
     BotCommand("startgame", "начать раунд"),
+    BotCommand("status", "статус игры"),
     BotCommand("roles", "все роли в личку"),
     BotCommand("sus", "подозревать игрока"),
     BotCommand("me", "моя тайная роль"),
@@ -199,21 +202,28 @@ def command_line(command: str, text: str) -> str:
     return f"▫️ <code>{esc(command)}</code> — {esc(text)}"
 
 
-async def reply_html(update: Update, text: str) -> None:
+async def reply_html(update: Update, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
     sent = await update.effective_message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+        reply_markup=reply_markup,
     )
     remember_bot_message(sent.chat_id, sent.message_id)
 
 
-async def send_html(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+async def send_html(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
     sent = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+        reply_markup=reply_markup,
     )
     remember_bot_message(sent.chat_id, sent.message_id)
 
@@ -249,6 +259,8 @@ def rules_text(short: bool = False) -> str:
         [
             command_line("/join", "войти в лобби"),
             command_line("/play", "самый простой вход в игру"),
+            command_line("/status", "понять, что сейчас происходит"),
+            command_line("/leave", "выйти из лобби до старта"),
             command_line("/startgame", "раздать роли"),
             command_line("/roles", "получить весь список ролей в личку"),
             command_line("/me", "посмотреть свою роль"),
@@ -277,6 +289,31 @@ def roles_text() -> str:
         "Вот все роли, чтобы понимать, кого подозревать. Пользоваться этим знанием можно мудро, а можно как обычно 😌",
         "\n".join(lines),
     )
+
+
+def role_by_name(role_name: str) -> Role | None:
+    normalized = role_name.strip().lower()
+    for role in ROLES:
+        if role.name.lower() == normalized:
+            return role
+    return None
+
+
+def role_buttons(target_user_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    for index, role in enumerate(ROLES):
+        rows.append([InlineKeyboardButton(role.name, callback_data=f"sus_role:{target_user_id}:{index}")])
+    rows.append([InlineKeyboardButton("Отмена", callback_data="sus_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def player_buttons(players: list[sqlite3.Row]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(player_name(player), callback_data=f"sus_target:{player['user_id']}")]
+        for player in players
+    ]
+    rows.append([InlineKeyboardButton("Отмена", callback_data="sus_cancel")])
+    return InlineKeyboardMarkup(rows)
 
 
 def level_for(points: int) -> int:
@@ -420,6 +457,65 @@ async def play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await join(update, context)
 
 
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat or chat.type == Chat.PRIVATE:
+        await reply_html(update, card("Статус", "В личке статуса группы нет. Открой игровой чат и напиши <code>/status</code>."))
+        return
+    remember_chat(chat)
+    with closing(db()) as conn:
+        game = active_game(conn, chat.id)
+        if game:
+            count = conn.execute("SELECT COUNT(*) FROM participants WHERE game_id = ?", (game["id"],)).fetchone()[0]
+            sus_count = conn.execute("SELECT COUNT(*) FROM suspicions WHERE game_id = ?", (game["id"],)).fetchone()[0]
+            await reply_html(update, card("Игра идет", f"Игроков: <b>{count}</b>\nПодозрений: <b>{sus_count}</b>", "Дальше: <code>/sus</code> кнопками или <code>/endgame</code> для финала."))
+            return
+        lobby = conn.execute(
+            "SELECT id FROM games WHERE chat_id = ? AND status = 'lobby' ORDER BY id DESC LIMIT 1",
+            (chat.id,),
+        ).fetchone()
+        if not lobby:
+            await reply_html(update, card("Игра не начата", "Игроки нажимают <code>/play</code>, потом запускаем <code>/startgame</code>."))
+            return
+        players = conn.execute(
+            """
+            SELECT pl.user_id, pl.username, pl.first_name
+            FROM participants p
+            JOIN players pl ON pl.user_id = p.user_id
+            WHERE p.game_id = ?
+            ORDER BY pl.first_name
+            """,
+            (lobby["id"],),
+        ).fetchall()
+    names = ", ".join(esc(player_name(player)) for player in players) or "пока никого"
+    await reply_html(update, card("Лобби", f"Игроков: <b>{len(players)}</b>\n{names}", "Дальше: <code>/play</code> для входа, <code>/leave</code> для выхода, <code>/startgame</code> для старта."))
+
+
+async def leave(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user or chat.type == Chat.PRIVATE:
+        await reply_html(update, card("Выход только в группе", "Из лобби выходят там же, где входили. Логично, почти философия."))
+        return
+    with closing(db()) as conn:
+        lobby = conn.execute(
+            "SELECT id FROM games WHERE chat_id = ? AND status = 'lobby' ORDER BY id DESC LIMIT 1",
+            (chat.id,),
+        ).fetchone()
+        if not lobby:
+            await reply_html(update, card("Лобби нет", "Сейчас неоткуда выходить. Свобода уже наступила."))
+            return
+        deleted = conn.execute(
+            "DELETE FROM participants WHERE game_id = ? AND user_id = ?",
+            (lobby["id"], user.id),
+        ).rowcount
+        conn.commit()
+    if deleted:
+        await reply_html(update, card("Вышел из лобби", f"{mention(user.id, user.first_name)} вышел. Драма отложена."))
+    else:
+        await reply_html(update, card("Ты не в лобби", "Нажми <code>/play</code>, если хочешь войти."))
+
+
 async def clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if not chat or chat.type == Chat.PRIVATE:
@@ -517,6 +613,7 @@ async def join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Игрок в лобби",
             f"{mention(user.id, user.first_name)} присоединился к раунду. Очень подозрительно, но пока законно 😎",
             f"<b>Игроков в лобби:</b> {count}\nКогда все готовы: <code>/startgame</code>\nПахнет интригой и групповым чатом.",
+            count >= 2 and "Игроков уже хватает. Можно запускать <code>/startgame</code>.",
         ),
     )
     try:
@@ -647,25 +744,108 @@ async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply_html(update, card("Твоя роль", f"<b>{esc(row['role_name'])}</b>", f"<b>Миссия:</b>\n{esc(row['mission'])}"))
 
 
+def record_suspicion(chat_id: int, suspect_user_id: int, target_user_id: int, guessed_role: str) -> tuple[str, sqlite3.Row | None]:
+    with closing(db()) as conn:
+        game = active_game(conn, chat_id)
+        if not game:
+            return "no_game", None
+
+        target = conn.execute(
+            """
+            SELECT pl.user_id, pl.username, pl.first_name, p.role_name
+            FROM participants p
+            JOIN players pl ON pl.user_id = p.user_id
+            WHERE p.game_id = ? AND pl.user_id = ?
+            """,
+            (game["id"], target_user_id),
+        ).fetchone()
+        if not target:
+            return "not_found", None
+        if target["user_id"] == suspect_user_id:
+            return "self", target
+
+        already = conn.execute(
+            """
+            SELECT id FROM suspicions
+            WHERE game_id = ? AND suspect_user_id = ? AND target_user_id = ?
+            """,
+            (game["id"], suspect_user_id, target["user_id"]),
+        ).fetchone()
+        if already:
+            return "already", target
+
+        correct = int(guessed_role.lower() == target["role_name"].lower())
+        conn.execute(
+            """
+            INSERT INTO suspicions (game_id, suspect_user_id, target_user_id, guessed_role, correct, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (game["id"], suspect_user_id, target["user_id"], guessed_role.lower(), correct, now_iso()),
+        )
+        if correct:
+            conn.execute(
+                "UPDATE participants SET exposed = 1 WHERE game_id = ? AND user_id = ?",
+                (game["id"], target["user_id"]),
+            )
+        conn.commit()
+        return ("correct" if correct else "wrong"), target
+
+
+def suspicion_result_text(status: str, target: sqlite3.Row | None, guessed_role: str) -> str:
+    if status == "no_game":
+        return card("Игра не идет", "Сначала запустите раунд: <code>/startgame</code>.")
+    if status == "not_found":
+        return card("Игрок не найден", "Этого игрока нет в текущем раунде.")
+    if status == "self":
+        return card("Нельзя на себя", "Красиво, но подозревать себя нельзя.")
+    if status == "already":
+        return card("Уже было", "На одного игрока можно кинуть одно подозрение за раунд.")
+    if status == "correct" and target:
+        return card("Верно", f"{mention(target['user_id'], player_name(target))} действительно <b>{esc(target['role_name'])}</b>.")
+    return card("Записал", f"Подозрение принято: <b>{esc(guessed_role)}</b>. Правду покажу в финале.")
+
+
 async def suspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     upsert_player(update)
     chat = update.effective_chat
     suspect_user = update.effective_user
     if not chat or not suspect_user or chat.type == Chat.PRIVATE:
-        await reply_html(update, card("Подозрение только в группе", "Формат: <code>/sus @username роль</code>"))
+        await reply_html(update, card("Только в группе", "Подозрения работают в игровом чате."))
         return
 
     if not context.args or len(context.args) < 2:
-        await reply_html(update, card("Нужен формат", "Напиши так: <code>/sus @username роль</code>"))
+        with closing(db()) as conn:
+            game = active_game(conn, chat.id)
+            if not game:
+                await reply_html(update, card("Игра не идет", "Сначала запустите раунд: <code>/startgame</code>."))
+                return
+            players = conn.execute(
+                """
+                SELECT pl.user_id, pl.username, pl.first_name
+                FROM participants p
+                JOIN players pl ON pl.user_id = p.user_id
+                WHERE p.game_id = ? AND pl.user_id != ?
+                ORDER BY pl.first_name
+                """,
+                (game["id"], suspect_user.id),
+            ).fetchall()
+        if not players:
+            await reply_html(update, card("Некого подозревать", "В раунде пока нет других игроков. Очень мирно. Слишком мирно."))
+            return
+        await reply_html(update, card("Кого подозреваешь?", "Выбери игрока кнопкой. Потом выберешь роль."), player_buttons(players))
         return
 
     target_token = context.args[0].lstrip("@").lower()
-    guessed_role = " ".join(context.args[1:]).strip().lower()
+    guessed_role = " ".join(context.args[1:]).strip()
+    role = role_by_name(guessed_role)
+    if not role:
+        await reply_html(update, card("Не знаю такую роль", "Проще напиши <code>/sus</code> и выбери роль кнопкой."))
+        return
 
     with closing(db()) as conn:
         game = active_game(conn, chat.id)
         if not game:
-            await reply_html(update, card("Нет активного раунда", "Сначала запустите игру через <code>/startgame</code>."))
+            await reply_html(update, card("Игра не идет", "Сначала запустите раунд: <code>/startgame</code>."))
             return
 
         target = conn.execute(
@@ -678,50 +858,68 @@ async def suspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             """,
             (game["id"], target_token, target_token),
         ).fetchone()
+    if not target:
+        await reply_html(update, card("Игрок не найден", "Напиши <code>/sus</code> и выбери игрока кнопкой."))
+        return
+
+    status, checked_target = record_suspicion(chat.id, suspect_user.id, target["user_id"], role.name)
+    await reply_html(update, suspicion_result_text(status, checked_target, role.name))
+
+
+async def suspicion_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.message or not query.from_user:
+        return
+    await query.answer()
+
+    data = query.data or ""
+    chat = query.message.chat
+    user = query.from_user
+
+    if data == "sus_cancel":
+        await query.edit_message_text("Ок, отменили. Подозрение ушло пить чай.", parse_mode=ParseMode.HTML)
+        return
+
+    if data.startswith("sus_target:"):
+        target_user_id = int(data.split(":", 1)[1])
+        with closing(db()) as conn:
+            game = active_game(conn, chat.id)
+            if not game:
+                await query.edit_message_text("Игра уже не идет. Драма закончилась раньше времени.")
+                return
+            target = conn.execute(
+                """
+                SELECT pl.user_id, pl.username, pl.first_name
+                FROM participants p
+                JOIN players pl ON pl.user_id = p.user_id
+                WHERE p.game_id = ? AND pl.user_id = ?
+                """,
+                (game["id"], target_user_id),
+            ).fetchone()
         if not target:
-            await reply_html(update, card("Игрок не найден", "Не вижу такого участника в текущем раунде. Надежнее всего использовать username."))
+            await query.edit_message_text("Игрока уже нет в раунде.")
             return
-        if target["user_id"] == suspect_user.id:
-            await reply_html(update, card("Красиво, но нет", "Самоподозрение звучит драматично, но очков за него не будет."))
-            return
-
-        already = conn.execute(
-            """
-            SELECT id FROM suspicions
-            WHERE game_id = ? AND suspect_user_id = ? AND target_user_id = ?
-            """,
-            (game["id"], suspect_user.id, target["user_id"]),
-        ).fetchone()
-        if already:
-            await reply_html(update, card("Подозрение уже есть", "На одного игрока можно сделать одно подозрение за раунд."))
-            return
-
-        correct = int(guessed_role == target["role_name"].lower())
-        conn.execute(
-            """
-            INSERT INTO suspicions (game_id, suspect_user_id, target_user_id, guessed_role, correct, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (game["id"], suspect_user.id, target["user_id"], guessed_role, correct, now_iso()),
+        await query.edit_message_text(
+            card("Какая роль?", f"Игрок: <b>{esc(player_name(target))}</b>\nВыбери роль кнопкой."),
+            parse_mode=ParseMode.HTML,
+            reply_markup=role_buttons(target_user_id),
         )
-        if correct:
-            conn.execute(
-                "UPDATE participants SET exposed = 1 WHERE game_id = ? AND user_id = ?",
-                (game["id"], target["user_id"]),
-            )
-        conn.commit()
+        return
 
-    if correct:
-        await reply_html(
-            update,
-            card(
-                "Попадание",
-                f"{mention(target['user_id'], player_name(target))} раскрыт.",
-                f"<b>Роль:</b> {esc(target['role_name'])}",
-            ),
+    if data.startswith("sus_role:"):
+        _, target_user_id_raw, role_index_raw = data.split(":")
+        target_user_id = int(target_user_id_raw)
+        role_index = int(role_index_raw)
+        if role_index < 0 or role_index >= len(ROLES):
+            await query.edit_message_text("Роль потерялась. Бывает даже у лучших.")
+            return
+        role = ROLES[role_index]
+        status, target = record_suspicion(chat.id, user.id, target_user_id, role.name)
+        await query.edit_message_text(
+            suspicion_result_text(status, target, role.name),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
-    else:
-        await reply_html(update, card("Подозрение записано", "Пока не раскрываю правду. Финал все расставит по местам."))
 
 
 async def complete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -940,6 +1138,8 @@ def build_app() -> Application:
     application.add_handler(MessageHandler(filters.Regex(r"^/хед(@\w+)?$"), head))
     application.add_handler(CommandHandler("play", play))
     application.add_handler(CommandHandler("roles", roles))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("leave", leave))
     application.add_handler(CommandHandler("clean", clean))
     application.add_handler(CommandHandler("join", join))
     application.add_handler(CommandHandler("startgame", start_game))
@@ -950,6 +1150,7 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("endgame", end_game))
     application.add_handler(CommandHandler("score", score))
     application.add_handler(CommandHandler("leaderboard", leaderboard))
+    application.add_handler(CallbackQueryHandler(suspicion_button, pattern=r"^sus_"))
     return application
 
 

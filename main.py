@@ -90,6 +90,7 @@ BOT_COMMANDS = [
     BotCommand("season", "сезон дня"),
     BotCommand("head", "справка по игре"),
     BotCommand("clean", "убрать сообщения бота"),
+    BotCommand("say", "сказать от лица бота"),
 ]
 
 CARD_EMOJIS = ["🎭", "🕵️", "✨", "🧠", "🔥", "💅", "👀", "🎲", "🏆", "🤌"]
@@ -296,7 +297,7 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if await is_admin(update, context):
         return True
-    await reply_html(update, card("Только админы", "Эта кнопка влияет на весь чат, поэтому без анархии. Почти."))
+    await reply_html(update, card("Только админы", "Это действие влияет на весь чат. Попроси админа или выдай себе корону официально."))
     return False
 
 
@@ -792,6 +793,26 @@ async def season(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply_html(update, card("Сезон дня", "\n".join(lines)))
 
 
+async def say(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    message = update.effective_message
+    if not chat or chat.type == Chat.PRIVATE:
+        await reply_html(update, card("Только в группе", "Команда <code>/say</code> нужна, чтобы бот говорил в чате."))
+        return
+    if not await require_admin(update, context):
+        return
+    text = " ".join(context.args).strip()
+    if not text:
+        await reply_html(update, card("Что сказать?", "Формат: <code>/say текст сообщения</code>"))
+        return
+    try:
+        await context.bot.delete_message(chat.id, message.message_id)
+    except TelegramError:
+        pass
+    sent = await context.bot.send_message(chat.id, text)
+    remember_bot_message(sent.chat_id, sent.message_id)
+
+
 async def join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     upsert_player(update)
     chat = update.effective_chat
@@ -1174,7 +1195,11 @@ async def action_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     elif data == "menu_status":
         await status(update, context)
     elif data == "menu_end":
-        await end_game(update, context)
+        chat = update.effective_chat
+        if chat and await is_admin(update, context):
+            await send_final_report(update, context, chat.id)
+        else:
+            await send_html(context, chat.id if chat else user.id, card("Только админы", "Финал запускает админ. Иначе кто-то нажмёт кнопку на 14-й секунде, мы уже это проходили."))
     elif data == "menu_clean":
         await clean(update, context)
     elif data == "menu_settings":
@@ -1472,6 +1497,22 @@ def finalize_game(chat_id: int) -> str | None:
     )
 
 
+async def send_final_report(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    timer = AUTO_FINAL_TASKS.pop(chat_id, None)
+    if timer:
+        timer.cancel()
+    try:
+        text = finalize_game(chat_id)
+    except Exception:
+        logger.exception("Failed to finalize game for chat %s", chat_id)
+        await reply_html(update, card("Финал сломался", "Я поймал ошибку и записал её в логи. Раунд не должен был так драматично закончиться."))
+        return
+    if not text:
+        await reply_html(update, card("Раунда нет", "Сейчас нет активной игры. Нажми <code>/status</code>, чтобы проверить состояние."))
+        return
+    await reply_html(update, text, main_menu())
+
+
 async def end_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     upsert_player(update)
     chat = update.effective_chat
@@ -1480,11 +1521,7 @@ async def end_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not await require_admin(update, context):
         return
-    text = finalize_game(chat.id)
-    if not text:
-        await reply_html(update, card("Раунда нет", "Активного раунда сейчас нет."))
-        return
-    await reply_html(update, text, main_menu())
+    await send_final_report(update, context, chat.id)
 
 
 async def score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1580,6 +1617,7 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("score", score))
     application.add_handler(CommandHandler("leaderboard", leaderboard))
     application.add_handler(CommandHandler("season", season))
+    application.add_handler(CommandHandler("say", say))
     application.add_handler(CallbackQueryHandler(suspicion_button, pattern=r"^sus_"))
     application.add_handler(CallbackQueryHandler(action_button, pattern=r"^(menu_|complete:|hint:|note:|settings_)"))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, save_private_note))
